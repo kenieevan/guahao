@@ -1,0 +1,148 @@
+#+OPTIONS: ^:nil
+* Introduction
+为了在几台linux os上，复现出k8s nodeport的data path，我们做了一些实验和代码跟踪。下文是对这个过程的详细介绍。
+
+k8s nodeport 模式下，多个client 通过访问(node ip:port) 的方法，访问后端的real server。
+packet 到达node 的时候，ip header 是这样的 (client ip  -->  node local ip )。
+它会经过如下的处理过程:
+
++ netfilter Prerouting hooks
+
+在这个chain下面，k8s 定义了一个mark 的规则。
+
+#+BEGIN_SRC 
+KUBE-MARK-MASQ  tcp  --  *      *     0.0.0.0/0      0.0.0.0/0      tcp match-set KUBE-NODE-PORT-TCP dst
+MARK       all  --  *      *       0.0.0.0/0            0.0.0.0/0            MARK or 0x4000
+#+END_SRC
+
+这些规则的含义是：if packet's dst ip  matches node ip and it is tcp , mark its skb as 0x4000。
+之所以mark是因为ipvs 修改了packet 的目的地址，为了让iptables postrouting snat 的过程认识它，所以特别做了mark。
+
+
++ lookup route
+
+发现dst ip 是local ip，进入Local in 的过程
+
++ local input hooks
+通过这个hook，进入了ipvs的代码。ipvs 的代码中主要是对这个packet 进行了dnat 处理，packet 变成了( client ip --> target server ip )。之后它主动调用了 local_out的hook
+
++ ipvs calls local output hooks
+这个hook下的函数没有修改packet
+
++ ipvs calls ip_output
+
+这个函数首先会调用post routing的钩子，进入iptable nat 的代码，进行snat 处理。
+#+BEGIN_SRC 
+
+KUBE-POSTROUTING  all  --  *      *    0.0.0.0/0    0.0.0.0/0     /* kubernetes postrouting rules */
+MASQUERADE  all  --  *  *  0.0.0.0/0  0.0.0.0/0  /* kubernetes service traffic requiring SNAT */ mark match 0x4000/0x4000
+#+END_SRC
+
+这些规则的意思是，只有mark 是 0x4000的packet，才会做snat。 这就是为什么前文要做mark 的原因。 经过了snat后，packet变成了 (lb output ip, --> target ip). 最后调用ip_output_finish2 发包。
+
++ ipvs calls ip_output_finish2
+
+* command
+
+在了解了它的data path之后，我们设计命令在复现此过程。在设计命令的过程中，遇到一个很大的坑，就是ipvs 会默认删除packet 的conntrack，使得后续的snat 代码无法运行。 解决方就是告诉ipvs 不要去删除conntrack entry，见下文。
+
+#+BEGIN_SRC 
+VIP=172.16.130.203
+VPORT=30123
+LBLIP=172.16.130.203
+TPORT=8099
+rs1=172.16.131.69
+rs2=
+rs3=
+#apt install -y ipvsadm
+ipvsadm -A -t $VIP:$VPORT -s rr
+ipvsadm -a -t  $VIP:$VPORT -r  $rs1:$TPORT -m
+iptables -t nat -A PREROUTING -p tcp --dport $VPORT  -j MARK --set-xmark 0x4000/0x4000
+iptables -t nat -A POSTROUTING  -m mark --mark 0x4000/0x4000  -j MASQUERADE
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+// ipvs will delete conntrack by default which make snat fail
+echo 1 > /proc/sys/net/ipv4/vs/conntrack
+#+END_SRC
+
+
+* source code process
+
+一开始不清楚ipvs 会清除conntrack entry，packet 不走snat过程，导致连接不通。为此trace了相关代码。这里把代码流程简单列出来，以备以后查看。
+
++ prerouting phase
+ip_rcv --> NF_INET_PREROUTING hooks -->  iptable_nat_ipv4_in -> iptable_nat_do_chain -> ipt_do_table 
+and in ipt_do_table, it will calls target function which is a mark .
+
++ routing process
+ip_rcv_finish -> ip_route_input_noref
+
+since the dst ip is localip, dst->input = ip_local_deliver.
+
++ local in  phase
+
+ipvs ip_vs_remote_request4 will stolen the packet from the system.
+
+ipvs will dnat the packets in ip_vs_nat_xmit()
+
+in this function, if flag is not set, ipvs will remove the packet from the conntrack.
+so we need to set this flag on
+#+BEGIN_SRC 
+if (likely(!(cp->flags & IP_VS_CONN_F_NFCT)))
+                ip_vs_notrack(skb);
+        else
+                ip_vs_update_conntrack(skb, cp, 1);
+
+#+END_SRC
+
+
+#+BEGIN_SRC 
+
+NF_HOOK(pf, NF_INET_LOCAL_OUT, cp->ipvs->net, NULL, skb,
+                        NULL, skb_dst(skb)->dev, dst_output);
+#+END_SRC
+
+at last, it will calls local out hooks and ip_ouput before return NF_STOLEN to the system.
+
++ local out
+
+Nothing useful will happend
+
++ ipvs -> ip_output
+
+#+BEGIN_SRC 
+ return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+                            net, sk, skb, NULL, dev,
+                            ip_finish_output,
+                            !(IPCB(skb)->flags & IPSKB_REROUTED));
+
+#+END_SRC
+
+
++ ipvs -> post routing phase
+
+
+iptable_nat_ipv4_out -> nf_nat_ipv4_fn -> ipt_do_table -> masquerade_tg -> nf_nat_masquerade_ipv4 
+
+This function choose approriate src ip and src port
+
+Finnaly, iptable_nat_ipv4_out -> nf_nat_ipv4_fn -> nf_nat_packet() to modify the packet.
+
+
++ ipvs -> ip_finish_output
+
+
+
+* kernel debug faclility
+
++ enable dynamic debug.
+
+echo 'file ip_tables.c +p' > /sys/kernel/debug/dynamic_debug/control
+
+echo 'file ip_tables.c line:xxx +p' > /sys/kernel/debug/dynamic_debug/control
+
+可以看到pr_debug() log
+
++ iptable raw trace 经常不好用，需要搭配LOG target 才好用。原因待查。
+
+
